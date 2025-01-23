@@ -304,9 +304,20 @@ export default class Postgre {
     const client = await this.adminPool.connect();
     try {
       const result = await client.query(`
-        SELECT table_name, column_name, data_type
-        FROM information_schema.columns
-        WHERE table_schema = 'public'
+        SELECT 
+          table_name, 
+          column_name, 
+          CASE
+            WHEN data_type = 'USER-DEFINED' 
+              THEN 
+                  udt_name
+              ELSE 
+                  data_type
+          END as data_type
+        FROM 
+            information_schema.columns
+        WHERE 
+            table_schema = 'public'
       `);
 
       const schema = result.rows.reduce((acc, row) => {
@@ -318,6 +329,54 @@ export default class Postgre {
       }, {});
 
       return schema;
+    } finally {
+      client.release();
+    }
+  }
+
+  async fetchExtensions() {
+    const client = await this.adminPool.connect();
+    try {
+      const result = await client.query(
+        `SELECT name, default_version as version, installed_version FROM pg_available_extensions;`
+      );
+
+      return result.rows.map(({ name, version, installed_version }) => {
+        return {
+          name,
+          version,
+          installed: Boolean(installed_version),
+        };
+      });
+    } catch (e) {
+      console.log(e);
+      return [];
+    } finally {
+      client.release();
+    }
+  }
+
+  async enableExtension(extension) {
+    const client = await this.adminPool.connect();
+    try {
+      await client.query(`CREATE EXTENSION IF NOT EXISTS ${extension}`);
+
+      return true;
+    } catch (e) {
+      return false;
+    } finally {
+      client.release();
+    }
+  }
+
+  async disableExtension(extension) {
+    const client = await this.adminPool.connect();
+    try {
+      await client.query(`DROP EXTENSION IF EXISTS ${extension};`);
+
+      return true;
+    } catch (e) {
+      return false;
     } finally {
       client.release();
     }
@@ -353,7 +412,7 @@ export default class Postgre {
   createFilterInputType(typeName, fields) {
     const filterFields = {};
 
-    Object.entries(fields).forEach(([fieldName, { type }]) => {
+    Object.entries(fields).forEach(([fieldName, { type, databaseType }]) => {
       filterFields[`${fieldName}`] = { type };
       filterFields[`${fieldName}_eq`] = { type };
       filterFields[`${fieldName}_ne`] = { type };
@@ -364,6 +423,14 @@ export default class Postgre {
       filterFields[`${fieldName}_like`] = { type: GraphQLString };
       filterFields[`${fieldName}_in`] = { type: new GraphQLList(type) };
       filterFields[`${fieldName}_nin`] = { type: new GraphQLList(type) };
+
+      // Add similarity filter for vector fields
+      if (databaseType === "vector") {
+        filterFields[`${fieldName}_near`] = {
+          // Input vector for similarity queries
+          type: new GraphQLList(GraphQLFloat),
+        };
+      }
     });
 
     return new GraphQLInputObjectType({
@@ -376,8 +443,14 @@ export default class Postgre {
   createOrderByInputType(typeName, fields) {
     const orderByEnumValues = {};
 
-    Object.entries(fields).forEach(([fieldName]) => {
+    Object.entries(fields).forEach(([fieldName, { databaseType }]) => {
       orderByEnumValues[fieldName] = { value: fieldName };
+      // Support ordering by similarity
+      if (databaseType === "vector") {
+        orderByEnumValues[fieldName + "_simil"] = {
+          value: fieldName + "_simil",
+        };
+      }
     });
 
     const OrderByEnum = new GraphQLEnumType({
@@ -417,14 +490,8 @@ export default class Postgre {
 
       for (const [fieldName, fieldType] of Object.entries(columns)) {
         const graphqlType = this.getGraphQLType(fieldType);
-        fields[fieldName] = { type: graphqlType };
+        fields[fieldName] = { type: graphqlType, databaseType: fieldType };
         inputFields[fieldName] = { type: graphqlType };
-        // Add similarity filter for vector fields
-        if (fieldType === "vector") {
-          inputFields[`${fieldName}_near`] = {
-            type: new GraphQLList(GraphQLFloat), // Input vector for similarity queries
-          };
-        }
       }
 
       typeDefs[typeName] = () => ({
@@ -545,23 +612,24 @@ export default class Postgre {
           resolve: async (_, { filter, orderBy }) => {
             const client = await this.adminPool.connect();
             try {
-              let query = `SELECT * FROM ${modelId}`;
               const whereClauses = [];
+              const variables = [];
               const params = [];
               if (filter) {
                 Object.entries(filter).forEach(([field, value], index) => {
-                  let vectorQuery;
-                  if (Array.isArray(value)) {
+                  // Need to handle _near first as the input value is an array
+                  if (field.endsWith("_near")) {
+                    // Vector similarity query
+                    const field_name = field.replace("_near", "");
+                    variables.push(
+                      `${field_name} <=> $${index + 1} AS ${field_name}_simil`
+                    );
+                    params.push(`[${value.join(",")}]`);
+                  } else if (Array.isArray(value)) {
                     whereClauses.push(
                       `${field} IN (${value.map((v, i) => `$${index + i + 1}`).join(", ")})`
                     );
                     params.push(...value);
-                  } else if (field.endsWith("_near")) {
-                    // Vector similarity query
-                    vectorQuery = {
-                      field: field.replace("_near", ""),
-                      vector: value,
-                    };
                   } else if (field.endsWith("_eq")) {
                     whereClauses.push(
                       `${field.replace("_eq", "")} = $${index + 1}`
@@ -620,19 +688,16 @@ export default class Postgre {
                     params.push(value);
                   }
                 });
-                if (vectorQuery) {
-                  query += `, ${vectorQuery.field} <=> $${params.length + 1} AS similarity`;
-                  whereClauses.push(`similarity IS NOT NULL`);
-                  params.push(vectorQuery.vector);
-                }
-                if (whereClauses.length > 0) {
-                  query += ` WHERE ${whereClauses.join(" AND ")}`;
-                }
               }
-              if (orderBy) {
-                query += ` ORDER BY "${orderBy.field}" ${orderBy.direction}`;
-              }
-              query += ` LIMIT 50`;
+
+              const query = `
+                SELECT * 
+                  ${variables.length ? ", " + variables.join(",") : ""} 
+                FROM 
+                  ${modelId}
+                ${whereClauses.length ? `WHERE ` + whereClauses.join(" AND ") : ""}
+                ${orderBy ? `ORDER BY "${orderBy.field}" ${orderBy.direction}` : ""}
+                LIMIT 50`;
               const result = await client.query(query, params);
               return result.rows;
             } finally {
@@ -782,7 +847,6 @@ export default class Postgre {
           { name: "mapped_name", type: "TEXT" },
           { name: "content", type: "JSONB" },
           { name: "indexed_at", type: "TIMESTAMP DEFAULT CURRENT_TIMESTAMP" }, // Added automatically
-          { name: "embedding", type: "VECTOR(1536)" },
         ],
       },
     ];
@@ -823,9 +887,8 @@ export default class Postgre {
       return false;
     }
 
-    const postgresFields = this.jsonSchemaToPostgresFields(
-      content.schema.properties
-    );
+    const [postgresFields, postgresIndexes] =
+      await this.jsonSchemaToPostgresFields(content.schema.properties);
 
     const title = content.name ? content.name : content.title;
     const uniqueFormattedTitle = await this.generateUniqueTableName(title);
@@ -842,7 +905,13 @@ export default class Postgre {
 
     // Step 3: Build SQL query and run
     console.log("In indexModel, callback is:", callback);
-    await this.createTable(model, fields, uniqueFormattedTitle, callback);
+    await this.createTable(
+      model,
+      fields,
+      uniqueFormattedTitle,
+      callback,
+      postgresIndexes
+    );
 
     await this.upsertRaw("kh4q0ozorrgaq2mezktnrmdwleo1d", {
       stream_id: stream.id.toString(),
@@ -858,14 +927,17 @@ export default class Postgre {
   /**
    * Will create a new table dynamically based on the model id and fields
    */
-  async createTable(model, fields, uniqueFormattedTitle, callback) {
+  async createTable(
+    model,
+    fields,
+    uniqueFormattedTitle,
+    callback,
+    indexes = []
+  ) {
     console.log("Enter createTable for model:", model);
     // Construct the columns part of the SQL statement
     // Construct the columns part of the SQL statement
 
-    if (!fields.some((field) => field.name === "embedding")) {
-      fields.push({ name: "embedding", type: "VECTOR(1536)" });
-  }
     const columns = fields
       .map((field) => {
         // Add UNIQUE constraint if field.unique is true
@@ -873,16 +945,18 @@ export default class Postgre {
         return `"${field.name}" ${field.type}${uniqueConstraint}`;
       })
       .join(", ");
-    
-  
 
     // Construct the full SQL statement for table creation
     const createTableQuery = `
-      CREATE TABLE IF NOT EXISTS "${model}" (${columns});
-      CREATE INDEX IF NOT EXISTS "${model}_stream_id_idx" ON "${model}" ("stream_id");
-      CREATE INDEX IF NOT EXISTS "${model}_controller_idx" ON "${model}" ("controller");
-      CREATE INDEX IF NOT EXISTS "${model}_indexed_at_idx" ON "${model}" ("indexed_at");
-      CREATE INDEX IF NOT EXISTS "${model}_embedding_idx" ON "${model}" USING ivfflat (embedding) WITH (lists = 100) WHERE embedding IS NOT NULL;
+CREATE TABLE IF NOT EXISTS "${model}" (${columns});
+CREATE INDEX IF NOT EXISTS "${model}_stream_id_idx" ON "${model}" ("stream_id");
+CREATE INDEX IF NOT EXISTS "${model}_controller_idx" ON "${model}" ("controller");
+CREATE INDEX IF NOT EXISTS "${model}_indexed_at_idx" ON "${model}" ("indexed_at");
+${indexes
+  .map(({ field: column, name, method, storage, predicate }) => {
+    return `CREATE INDEX IF NOT EXISTS "${model}_${name || `${column}_idx`}" ON "${model}" ${method ? `USING ${method}` : ``} (${column}) ${storage ? `WITH ${storage}` : ``} ${predicate ? `WHERE ${predicate}` : ``};`;
+  })
+  .join("\n")}
     `;
 
     console.log("createTableQuery:", createTableQuery);
@@ -1160,60 +1234,154 @@ export default class Postgre {
   }
 
   /** Will convert the properties from the JSON schemas into Postgre's fields to create the new table */
-jsonSchemaToPostgresFields(jsonSchema) {
-  const postgresFields = [];
+  async jsonSchemaToPostgresFields(jsonSchema) {
+    const postgresFields = [];
+    const postgresIndexes = [];
 
-  for (const key in jsonSchema) {
-    const value = jsonSchema[key];
+    for (const key in jsonSchema) {
+      const value = jsonSchema[key];
 
-    // Determine PostgreSQL data type based on JSON schema
-    let postgresType;
+      const customDefinition = await this.parseCustomFieldDefinition(
+        key,
+        value
+      );
 
-    // Check for specific "embedding" field
-    if (key === "embedding") {
-      postgresType = "VECTOR(1536)"; // Explicitly set the VECTOR type for embedding
-    } else if (Array.isArray(value.type)) {
-      if (value.type.includes("object") || value.type.includes("array")) {
-        postgresType = "JSONB";
-      } else {
-        // Handles basic types (string, number) with possible nulls
-        postgresType = this.jsonTypeToPostgresType(value.type[0]);
+      if (customDefinition) {
+        if (customDefinition.index) {
+          postgresIndexes.push(customDefinition.index);
+        }
       }
-    } else {
-      postgresType = this.jsonTypeToPostgresType(value.type);
+
+      // Determine PostgreSQL data type based on JSON schema
+      let postgresType;
+
+      // Check for specific "embedding" field
+      if (customDefinition?.type) {
+        postgresType = customDefinition.type;
+      } else if (Array.isArray(value.type)) {
+        if (value.type.includes("object") || value.type.includes("array")) {
+          postgresType = "JSONB";
+        } else {
+          // Handles basic types (string, number) with possible nulls
+          postgresType = this.jsonTypeToPostgresType(value.type[0]);
+        }
+      } else {
+        postgresType = this.jsonTypeToPostgresType(value.type);
+      }
+
+      // Detect additional fields using the $comment field
+      let additionalParameters;
+      let unique = false;
+      let convert_to;
+
+      if (value.$comment) {
+        // Try to parse comment field
+        try {
+          additionalParameters = JSON.parse(value.$comment);
+        } catch (e) {
+          console.log("Error parsing $comment field:", e);
+        }
+
+        if (additionalParameters) {
+          // Handle Unique
+          unique = additionalParameters.unique;
+
+          // Handle convert_to
+          convert_to = additionalParameters.convert_to;
+          if (convert_to === "object" || convert_to === "array") {
+            postgresType = "JSONB";
+          }
+        }
+      }
+
+      postgresFields.push({ name: key, type: postgresType, unique: unique });
     }
 
-    // Detect additional fields using the $comment field
-    let additionalParameters;
-    let unique = false;
-    let convert_to;
+    return [postgresFields, postgresIndexes];
+  }
 
-    if (value.$comment) {
-      // Try to parse comment field
-      try {
-        additionalParameters = JSON.parse(value.$comment);
-      } catch (e) {
-        console.log("Error parsing $comment field:", e);
+  async #checkExtensionsRequirement(requiredExtensions) {
+    if (!requiredExtensions || !requiredExtensions.length) {
+      return true;
+    }
+
+    let availableExtensions = await this.fetchExtensions();
+
+    for (const ext of requiredExtensions) {
+      const exists = availableExtensions.find(
+        (extension) => extension.name === ext
+      );
+
+      if (!exists) {
+        return false;
       }
 
-      if (additionalParameters) {
-        // Handle Unique
-        unique = additionalParameters.unique;
-
-        // Handle convert_to
-        convert_to = additionalParameters.convert_to;
-        if (convert_to === "object" || convert_to === "array") {
-          postgresType = "JSONB";
+      if (!exists.installed) {
+        try {
+          await this.enableExtension(exists.name);
+          console.log(
+            "Enabled extension:",
+            exists.name,
+            "| Refreshing extension list..."
+          );
+          availableExtensions = await this.fetchExtensions();
+        } catch (e) {
+          console.error("Failed to enable extension", e);
+          return false;
         }
       }
     }
 
-    postgresFields.push({ name: key, type: postgresType, unique: unique });
+    return true;
   }
 
-  return postgresFields;
-}
+  async parseCustomFieldDefinition(name, definition) {
+    if (!definition.examples?.length) {
+      return false;
+    }
 
+    const customDefinitionObject = definition.examples.find(
+      (value) => typeof value === "object" && "x-orbisdb" in value
+    );
+    if (!customDefinitionObject) {
+      return false;
+    }
+
+    const customDefinition =
+      customDefinitionObject["x-orbisdb"].postgres ||
+      customDefinitionObject["x-orbisdb"].pg;
+
+    if (!customDefinition || typeof customDefinition !== "object") {
+      return false;
+    }
+
+    const extensionSupport = await this.#checkExtensionsRequirement(
+      customDefinition.extensions || []
+    );
+
+    let customIndex;
+    if (!customDefinition.index) {
+      customIndex = false;
+    } else if (
+      typeof customDefinition.index === "boolean" ||
+      !extensionSupport
+    ) {
+      customIndex = customDefinition.index ? { field: name } : false;
+    } else if (typeof customDefinition.index === "object") {
+      customIndex = {
+        ...customDefinition.index,
+        field: name,
+      };
+    }
+
+    return {
+      type:
+        extensionSupport && typeof customDefinition.type === "string"
+          ? customDefinition.type
+          : false,
+      index: customIndex,
+    };
+  }
 
   /** Simple converter between json format nomenclature and Postgre */
   jsonTypeToPostgresType(jsonType) {
@@ -1243,4 +1411,3 @@ jsonSchemaToPostgresFields(jsonSchema) {
     }
   }
 }
-
